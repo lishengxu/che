@@ -10,6 +10,7 @@
  *******************************************************************************/
 package org.eclipse.che.plugin.maven.server.core.project;
 
+import org.eclipse.che.api.core.ForbiddenException;
 import org.eclipse.che.api.core.NotFoundException;
 import org.eclipse.che.api.core.ServerException;
 import org.eclipse.che.api.project.server.EditorWorkingCopyManager;
@@ -279,17 +280,14 @@ public class MavenProject {
             return null;
         }
 
-
-
         File pomFile = null;
         if (workingCopyManager != null) {
             try {
                 pomFile = workingCopyManager.getWorkingCopyFile(file.getFullPath().toOSString());
-            } catch (NotFoundException | ServerException e) {
-                e.printStackTrace();
+            } catch (NotFoundException | ServerException | ForbiddenException e) {
+                //ignore
             }
         }
-
         return pomFile != null ? pomFile : file.getLocation().toFile();
     }
 

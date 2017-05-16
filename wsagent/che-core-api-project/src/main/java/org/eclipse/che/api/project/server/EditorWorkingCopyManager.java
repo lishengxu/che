@@ -16,12 +16,15 @@ import org.eclipse.che.api.core.ConflictException;
 import org.eclipse.che.api.core.ForbiddenException;
 import org.eclipse.che.api.core.NotFoundException;
 import org.eclipse.che.api.core.ServerException;
+import org.eclipse.che.api.core.jsonrpc.JsonRpcException;
 import org.eclipse.che.api.core.notification.EventService;
 import org.eclipse.che.api.core.notification.EventSubscriber;
 import org.eclipse.che.api.project.server.notification.EditorContentUpdatedEvent;
 import org.eclipse.che.api.project.shared.dto.EditorChangesDto;
 import org.eclipse.che.api.project.shared.dto.event.FileTrackingOperationDto;
 import org.eclipse.che.api.vfs.impl.file.event.detectors.FileTrackingOperationEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
@@ -29,9 +32,9 @@ import javax.inject.Provider;
 import javax.inject.Singleton;
 import java.io.File;
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static java.lang.String.format;
@@ -43,13 +46,14 @@ import static org.eclipse.che.api.project.shared.Constants.CHE_DIR;
  */
 @Singleton
 public class EditorWorkingCopyManager {
+    private static final Logger LOG                = LoggerFactory.getLogger(EditorWorkingCopyManager.class);
     private static final String WORKING_COPIES_DIR = "/" + CHE_DIR + "/workingCopies";
 
     private Provider<ProjectManager>                    projectManagerProvider;
     private EventService                                eventService;
     private EventSubscriber<FileTrackingOperationEvent> fileOperationEventSubscriber;
 
-    private final Map<String, EditorWorkingCopy> workingCopiesStorage = new HashMap<>();
+    private final Map<String, EditorWorkingCopy> workingCopiesStorage = new ConcurrentHashMap<>();
 
     @Inject
     public EditorWorkingCopyManager(Provider<ProjectManager> projectManagerProvider,
@@ -60,20 +64,30 @@ public class EditorWorkingCopyManager {
         fileOperationEventSubscriber = new EventSubscriber<FileTrackingOperationEvent>() {
             @Override
             public void onEvent(FileTrackingOperationEvent event) {
-                onFileOperation(event.getFileTrackingOperation());
+                onFileOperation(event.getEndpointId(), event.getFileTrackingOperation());
             }
         };
         eventService.subscribe(fileOperationEventSubscriber);
     }
 
-    public File getWorkingCopyFile(String filePath) throws NotFoundException, ServerException {
-        String projectPath = projectManagerProvider.get().asFile(filePath).getProject();
-        VirtualFileEntry virtualFileEntry = getPersistentWorkingCopy(filePath, projectPath);
-        return virtualFileEntry == null ? null : new File(virtualFileEntry.getVirtualFile().toIoFile().getAbsolutePath());
+    public File getWorkingCopyFile(String filePath) throws NotFoundException, ServerException, ForbiddenException {
+        VirtualFileEntry persistentWorkingCopy = null;
+        if (workingCopiesStorage.containsKey(filePath)) {
+            EditorWorkingCopy workingCopy = workingCopiesStorage.get(filePath);
+            byte[] workingCopyContent = workingCopy.getContentAsBytes();
+
+            persistentWorkingCopy = getPersistentWorkingCopy(filePath, workingCopy.getProjectPath());
+            persistentWorkingCopy.getVirtualFile().updateContent(workingCopyContent);
+        } else {
+            FileEntry originalFile = projectManagerProvider.get().asFile(filePath);
+            if (originalFile != null) {
+                persistentWorkingCopy = getPersistentWorkingCopy(filePath, originalFile.getProject());
+            }
+        }
+        return persistentWorkingCopy == null ? null : new File(persistentWorkingCopy.getVirtualFile().toIoFile().getAbsolutePath());
     }
 
-    public String getContentFor(String filePath)
-            throws NotFoundException, ServerException, ConflictException, ForbiddenException {
+    public String getContentFor(String filePath) throws NotFoundException, ServerException, ConflictException, ForbiddenException {
         EditorWorkingCopy workingCopy = workingCopiesStorage.get(filePath);
         if (workingCopy != null) {
             return workingCopy.getContentAsString();
@@ -83,11 +97,7 @@ public class EditorWorkingCopyManager {
         if (originalFile == null) {
             throw new NotFoundException(format("Item '%s' isn't found. ", filePath));
         }
-
-        String projectPath = originalFile.getProject();
-        VirtualFileEntry persistentWorkingCopy = getPersistentWorkingCopy(filePath, projectPath);
-        return persistentWorkingCopy == null ? originalFile.getVirtualFile().getContentAsString()
-                                             : persistentWorkingCopy.getVirtualFile().getContentAsString();
+        return originalFile.getVirtualFile().getContentAsString();
     }
 
     void onEditorContentUpdated(String endpointId, EditorChangesDto changes) {
@@ -97,6 +107,7 @@ public class EditorWorkingCopyManager {
             String text = changes.getText();
             int offset = changes.getOffset();
             int removedCharCount = changes.getRemovedCharCount();
+
             EditorWorkingCopy workingCopy = workingCopiesStorage.get(filePath);
             if (workingCopy == null) {
                 workingCopy = createWorkingCopy(filePath);
@@ -127,23 +138,32 @@ public class EditorWorkingCopyManager {
             }
 
             if (newContent != null) {
-                //TODO
                 System.out.println("*********** EditorWorkingCopyManager onWorkingCopyChanged update workingCopy " + filePath);
-
                 workingCopy.updateContent(newContent);
-                VirtualFileEntry virtualFileEntry = getPersistentWorkingCopy(filePath, projectPath);
-                virtualFileEntry.getVirtualFile().updateContent(newContent);
                 eventService.publish(new EditorContentUpdatedEvent(endpointId, changes));
+
+                //TODO only for testing
+                VirtualFileEntry persistentWorkingCopy = getPersistentWorkingCopy(filePath, projectPath);
+                persistentWorkingCopy.getVirtualFile().updateContent(newContent);
             }
 
-        } catch (Exception e) {
-            //TODO handle exception
-            System.out.println(e.getMessage());
+        } catch (ServerException | IOException | ForbiddenException | ConflictException e) {
+            String errorMessage = "Can not handle editors changes: " + e.getMessage();
+
+            LOG.error(errorMessage);
+
+            throw new JsonRpcException(500, errorMessage, endpointId);
+        } catch (NotFoundException e) {
+            String errorMessage = "Can not handle editors changes: " + e.getMessage();
+
+            LOG.error(errorMessage);
+
+            throw new JsonRpcException(400, errorMessage, endpointId);
         }
     }
 
 
-    private void onFileOperation(FileTrackingOperationDto operation) {
+    private void onFileOperation(String endpointId, FileTrackingOperationDto operation) {
         try {
             FileTrackingOperationDto.Type type = operation.getType();
             System.out.println("*********** EditorWorkingCopyManager onFileOperation " + type);
@@ -178,8 +198,8 @@ public class EditorWorkingCopyManager {
                     String oldPath = operation.getOldPath();
                     String newPath = operation.getPath();
                     if (isNullOrEmpty(oldPath) || isNullOrEmpty(newPath)) {
-                        //TODO
-                        return;
+                        throw new NotFoundException(
+                                "Can't handle 'move' file operation: old path and new path for the file should be defined");
                     }
 
                     EditorWorkingCopy workingCopy = workingCopiesStorage.remove(oldPath);
@@ -187,7 +207,7 @@ public class EditorWorkingCopyManager {
                         return;
                     }
 
-                    String workingCopyNewPath = getWorkingCopyPath(newPath);
+                    String workingCopyNewPath = toWorkingCopyPath(newPath);
                     workingCopy.setPath(workingCopyNewPath);
                     workingCopiesStorage.put(newPath, workingCopy);
 
@@ -210,22 +230,25 @@ public class EditorWorkingCopyManager {
                     break;
                 }
             }
+        } catch (ServerException | IOException | ForbiddenException | ConflictException e) {
+            String errorMessage = "Can not handle file operation: " + e.getMessage();
 
-        } catch (NotFoundException | ServerException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
-        } catch (ForbiddenException e) {
-            e.printStackTrace();
-        } catch (ConflictException e) {
-            e.printStackTrace();
+            LOG.error(errorMessage);
+
+            throw new JsonRpcException(500, errorMessage, endpointId);
+        } catch (NotFoundException e) {
+            String errorMessage = "Can not handle file operation: " + e.getMessage();
+
+            LOG.error(errorMessage);
+
+            throw new JsonRpcException(400, errorMessage, endpointId);
         }
     }
 
     private boolean isWorkingCopyHasUnsavedData(String path) {
         try {
             EditorWorkingCopy workingCopy = workingCopiesStorage.remove(path);
-            FileEntry originalFile = originalFile = projectManagerProvider.get().asFile(path);
+            FileEntry originalFile = projectManagerProvider.get().asFile(path);
             if (workingCopy == null || originalFile == null) {
                 return false;
             }
@@ -252,8 +275,7 @@ public class EditorWorkingCopyManager {
 
         FileEntry file = projectManagerProvider.get().asFile(filePath);
         if (file == null) {
-            //TODO
-            return null;
+            throw new NotFoundException(format("Item '%s' isn't found. ", filePath));
         }
 
         String projectPath = file.getProject();
@@ -262,30 +284,28 @@ public class EditorWorkingCopyManager {
             persistentWorkingCopiesStorage = createWorkingCopiesStorage(projectPath);
         }
 
-
-        String workingCopyPath = getWorkingCopyPath(filePath);
+        String workingCopyPath = toWorkingCopyPath(filePath);
         byte[] content = file.contentAsBytes();
         persistentWorkingCopiesStorage.createFile(workingCopyPath, content);
 
         EditorWorkingCopy workingCopy = new EditorWorkingCopy(workingCopyPath, projectPath, file.contentAsBytes());
         workingCopiesStorage.put(filePath, workingCopy);
+
         return workingCopy;
     }
 
     private VirtualFileEntry getPersistentWorkingCopy(String filePath, String projectPath) {
-        VirtualFileEntry entry = null;
         try {
             FolderEntry workingCopiesStorage = getPersistentWorkingCopiesStorage(projectPath);
             if (workingCopiesStorage == null) {
                 return null;
             }
 
-            String workingCopyPath = getWorkingCopyPath(filePath);
+            String workingCopyPath = toWorkingCopyPath(filePath);
             return workingCopiesStorage.getChild(workingCopyPath);
         } catch (ServerException e) {
-            //ignore
+            return null;
         }
-        return entry;
     }
 
     private FolderEntry getPersistentWorkingCopiesStorage(String projectPath) {
@@ -317,7 +337,7 @@ public class EditorWorkingCopyManager {
         }
     }
 
-    private String getWorkingCopyPath(String path) {
+    private String toWorkingCopyPath(String path) {
         if (path.startsWith("/")) {
             path = path.substring(1, path.length());
         }

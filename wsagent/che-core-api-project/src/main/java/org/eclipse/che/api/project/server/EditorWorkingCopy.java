@@ -10,25 +10,6 @@
  *******************************************************************************/
 package org.eclipse.che.api.project.server;
 
-import org.eclipse.che.api.core.ConflictException;
-import org.eclipse.che.api.core.ForbiddenException;
-import org.eclipse.che.api.core.NotFoundException;
-import org.eclipse.che.api.core.ServerException;
-import org.eclipse.che.api.core.notification.EventService;
-import org.eclipse.che.api.core.notification.EventSubscriber;
-import org.eclipse.che.api.project.server.notification.EditorContentUpdatedEvent;
-import org.eclipse.che.api.project.shared.dto.EditorChangesDto;
-import org.eclipse.che.api.project.shared.dto.event.FileTrackingOperationDto;
-import org.eclipse.che.api.vfs.impl.file.event.detectors.FileTrackingOperationEvent;
-
-import javax.annotation.PreDestroy;
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.io.File;
-import java.io.IOException;
-
-import static org.eclipse.che.api.project.shared.Constants.CHE_DIR;
-
 /**
  * @author Roman Nikitenko
  */
